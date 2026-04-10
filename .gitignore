@@ -1,6 +1,6 @@
-outputs/
-checkpoints/
-data/
+outputs/*
+checkpoints/*
+data/*
 *.jpg
 *.jpeg
 *.png
