@@ -1,6 +1,27 @@
 # (Local) GUI for SD 1.5 - Inpainting
 Basic drawing functionality and +/- prompt inputs for mask-based inpainting.
 
+A GUI & pipeline for diffusion inference and finetuning (+ inference while finetuning).
+
+The Inference GUI (using `dearpygui`):
+- Load image as a thumbnail with,
+    - Dragable square for selecting `512x512` pixel patches for inference
+- Pass pixel patch to Mask-creation window. Masks are drawn with:
+    - Circular brush/eraser with adjustable sizing
+    - AABB click & drag rectangles
+- Load the model and show output to the viewer
+    - Results saved in `./outputs`
+
+![Demo screenshot](assets/GUI.png)
+
+
+The Traniing GUI:
+- Load model on the Inference GUI tab
+- Configure the settings in the training tab
+- Hit run and plot the loss
+
+![Demo shot](assets/training_screen.png)
+
 ## Models
 - SD v1.5 - Inpainting
 - VAE `vae-ft-mse-840000-ema-pruned`
