@@ -7,24 +7,31 @@ import torch
 import time
 
 from modules.inpainting import SDInpaintingModel, build_pipeline
+from modules.trainer import SDInpaintingTrainer
 
 PREVIEW_W = 512
 PREVIEW_H = 512
 
-THUMB_W = 256   # thumbnail panel width
-THUMB_H = 256   # thumbnail panel height
+THUMB_W = 256
+THUMB_H = 256
+
+LOSS_W = 400
+LOSS_H = 200
 
 
 class GUI:
 
-    def __init__(self):
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+        
         self.state = {
             "image_path": None,
             "mask_path":  None,
             "pipeline":   None,
             "running":    False,
         }
-
+        
         self.image_np   = np.full((PREVIEW_H, PREVIEW_W, 3), 0.15, dtype=np.float32)
         self.buf_image  = np.full((PREVIEW_W * PREVIEW_H * 3,), 0.15, dtype=np.float32)
         self.buf_output = np.full((PREVIEW_W * PREVIEW_H * 3,), 0.15, dtype=np.float32)
@@ -36,17 +43,21 @@ class GUI:
         self.brush_radius = 20
         self.rect_start   = None
 
-        # Crop state — stored as pixel coords on the THUMBNAIL
-        # crop_box = (tx, ty, tsize) where tsize is the side length in thumbnail pixels
-        self.orig_image_pil = None   # full-res original PIL image
-        self.crop_box       = None   # (tx, ty, tsize) in thumbnail coords
-        self.crop_dragging  = False  # dragging the crop box
-        self.crop_drag_off  = (0, 0) # offset from box top-left when drag started
+        self.orig_image_pil = None
+        self.crop_box       = None
+        self.crop_dragging  = False
+        self.crop_drag_off  = (0, 0)
+        self.loss_dirty = False
 
         self.output_dir = "./outputs"
 
+        # Training state
+        self.trainer        = None
+        self.training       = False
+        self.loss_history   = []   # list of (step, loss) tuples
+
     # ------------------------------------------------------------------
-    # Composite mask onto canvas image
+    # Composite
     # ------------------------------------------------------------------
 
     def _composite(self):
@@ -63,14 +74,12 @@ class GUI:
         return np.array(img, dtype=np.float32) / 255.0
 
     # ------------------------------------------------------------------
-    # Thumbnail helpers
+    # Thumbnail
     # ------------------------------------------------------------------
 
     def _update_thumb(self):
-        """Redraw thumbnail texture and crop box overlay."""
         if self.orig_image_pil is None:
             return
-        # Fit original image into THUMB_W x THUMB_H letterboxed
         orig_w, orig_h = self.orig_image_pil.size
         scale = min(THUMB_W / orig_w, THUMB_H / orig_h)
         fit_w = int(orig_w * scale)
@@ -84,10 +93,8 @@ class GUI:
         np.copyto(self.buf_thumb, thumb_img.flatten())
         dpg.set_value("tex_thumb", self.buf_thumb)
 
-        # Store fit info for coord mapping
         self._thumb_fit = (off_x, off_y, fit_w, fit_h, orig_w, orig_h, scale)
 
-        # Init crop box if not set — default to largest square centred in fit area
         if self.crop_box is None:
             tsize = min(fit_w, fit_h)
             tx = off_x + (fit_w - tsize) // 2
@@ -126,7 +133,6 @@ class GUI:
         return tx <= x <= tx + tsize and ty <= y <= ty + tsize
 
     def _clamp_crop_box(self):
-        """Keep crop box within the fitted image area."""
         if self.crop_box is None or not hasattr(self, "_thumb_fit"):
             return
         off_x, off_y, fit_w, fit_h, *_ = self._thumb_fit
@@ -136,12 +142,10 @@ class GUI:
         self.crop_box = [tx, ty, tsize]
 
     def _crop_to_orig_coords(self):
-        """Convert crop box thumbnail coords → original image pixel rect."""
         if self.crop_box is None or not hasattr(self, "_thumb_fit"):
             return None
         off_x, off_y, fit_w, fit_h, orig_w, orig_h, scale = self._thumb_fit
         tx, ty, tsize = self.crop_box
-        # Map from thumb coords back to original image coords
         ox = int((tx - off_x) / scale)
         oy = int((ty - off_y) / scale)
         osize = int(tsize / scale)
@@ -150,7 +154,6 @@ class GUI:
         return ox, oy, osize
 
     def _get_cropped_image(self) -> Image.Image:
-        """Return the crop region of the original image as a PIL image."""
         if self.orig_image_pil is None:
             return None
         coords = self._crop_to_orig_coords()
@@ -160,7 +163,6 @@ class GUI:
         return self.orig_image_pil.crop((ox, oy, ox + osize, oy + osize))
 
     def _load_crop_into_canvas(self):
-        """Load the current crop region into the canvas + reset mask."""
         cropped = self._get_cropped_image()
         if cropped is None:
             return
@@ -236,23 +238,19 @@ class GUI:
                               parent="mask_canvas_win", tag="cursor_circle")
 
     # ------------------------------------------------------------------
-    # Mouse handlers
+    # Mouse
     # ------------------------------------------------------------------
 
     def on_mouse_down(self, sender, app_data):
         btn = app_data[0] if isinstance(app_data, (list, tuple)) else app_data
         if btn != 0:
             return
-
-        # Crop box drag on thumbnail
         if self._is_over_thumb() and self.crop_box is not None:
             tx, ty = self._thumb_local_pos()
-
             if self._is_over_crop_box(tx, ty):
                 self.crop_dragging = True
                 self.crop_drag_off = (tx - self.crop_box[0], ty - self.crop_box[1])
                 return
-        # Brush on canvas
         if self._is_over_canvas() and self.draw_mode == "brush":
             x, y = self._canvas_local_pos()
             self._paint_brush(x, y)
@@ -261,8 +259,6 @@ class GUI:
         btn = app_data[0] if isinstance(app_data, (list, tuple)) else app_data
         if btn != 0:
             return
-        
-        
         if self._is_over_canvas() and self.draw_mode == "rect":
             x, y = self._canvas_local_pos()
             if self.rect_start is None:
@@ -273,7 +269,6 @@ class GUI:
 
     def on_mouse_move(self, sender, app_data):
         self._redraw_cursor()
-        # Drag crop box
         if self.crop_dragging and dpg.is_mouse_button_down(0):
             tx, ty = self._thumb_local_pos()
             self.crop_box[0] = tx - self.crop_drag_off[0]
@@ -282,7 +277,6 @@ class GUI:
             self._redraw_crop_box()
             self._load_crop_into_canvas()
             return
-        # Brush drag on canvas
         if dpg.is_mouse_button_down(0) and self._is_over_canvas() and self.draw_mode == "brush":
             x, y = self._canvas_local_pos()
             self._paint_brush(x, y)
@@ -335,7 +329,7 @@ class GUI:
         self.state["image_path"] = path
         dpg.set_value("image_path_text", path)
         self.orig_image_pil = Image.open(path).convert("RGB")
-        self.crop_box = None  # reset crop on new image
+        self.crop_box = None
         self._update_thumb()
         self._load_crop_into_canvas()
 
@@ -346,6 +340,124 @@ class GUI:
         self.mask_np = np.array(img, dtype=np.float32) / 255.0
         self._composite()
         dpg.set_value("mask_path_text", path)
+
+    def on_data_dir_selected(self, sender, app_data, user_data=None):
+        path = app_data["file_path_name"]
+        dpg.set_value("train_data_dir", path)
+
+    # ------------------------------------------------------------------
+    # Loss graph
+    # ------------------------------------------------------------------
+
+    def _redraw_loss_graph(self):
+        dpg.delete_item("loss_graph", children_only=True)
+        if len(self.loss_history) < 2:
+            return
+
+        steps  = [s for s, _ in self.loss_history]
+        losses = [l for _, l in self.loss_history]
+
+        max_loss = max(losses) if losses else 1.0
+        min_loss = min(losses) if losses else 0.0
+        loss_range = max_loss - min_loss or 1.0
+
+        pad = 10
+        w = LOSS_W - pad * 2
+        h = LOSS_H - pad * 2
+
+        def to_px(i, loss):
+            x = pad + (i / max(len(steps) - 1, 1)) * w
+            y = pad + (1.0 - (loss - min_loss) / loss_range) * h
+            return x, y
+
+        # Grid lines
+        for i in range(5):
+            gy = pad + i * h / 4
+            dpg.draw_line((pad, gy), (pad + w, gy),
+                          color=(80, 80, 80, 120), thickness=1, parent="loss_graph")
+
+        # Loss line
+        for i in range(len(steps) - 1):
+            x0, y0 = to_px(i,   losses[i])
+            x1, y1 = to_px(i+1, losses[i+1])
+            dpg.draw_line((x0, y0), (x1, y1),
+                          color=(100, 220, 100, 255), thickness=2, parent="loss_graph")
+
+        # Latest loss label
+        latest = losses[-1]
+        dpg.draw_text((pad + 4, pad + 4), f"loss {latest:.4f}",
+                      color=(200, 200, 200, 255), size=13, parent="loss_graph")
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def _set_train_status(self, msg: str, error: bool = False):
+        dpg.set_value("train_status_text", msg)
+        color = (220, 80, 80, 255) if error else (100, 220, 100, 255)
+        dpg.configure_item("train_status_text", color=color)
+
+    def start_training(self):
+        if self.state["pipeline"] is None:
+            self._set_train_status("Load the model first (Inference tab > Load Model).", error=True)
+            return
+        if self.training:
+            self._set_train_status("Already training.", error=True)
+            return
+
+        data_dir   = dpg.get_value("train_data_dir")
+        epochs     = int(dpg.get_value("train_epochs"))
+        lr         = float(dpg.get_value("train_lr"))
+        rank       = int(dpg.get_value("train_rank"))
+        save_every = int(dpg.get_value("train_save_every"))
+        out_dir    = dpg.get_value("train_out_dir")
+        batch_size = int(dpg.get_value("train_batch_size"))
+
+        if not data_dir:
+            self._set_train_status("Set a data directory first.", error=True)
+            return
+
+        self.loss_history = []
+        self.training = True
+        dpg.configure_item("train_button", enabled=False, label="Training...")
+        dpg.configure_item("stop_button", enabled=True)
+        self._set_train_status("Training started...")
+
+        def _worker():
+            try:
+                model = self.state["pipeline"]
+                self.trainer = SDInpaintingTrainer(model, output_dir=out_dir, rank=rank, cfg=self.cfg["training"])
+                
+                def loss_callback(epoch, step, total_steps, loss):
+                    self.loss_history.append((len(self.loss_history), loss))
+                    self.loss_dirty = True
+                    dpg.set_value("train_status_text",
+                                f"Epoch {epoch}  step {step}/{total_steps}  loss {loss:.4f}")
+                    
+
+                self.trainer.train(
+                    data_dir=data_dir,
+                    epochs=epochs,
+                    batch_size=batch_size,
+                    lr=lr,
+                    save_every=save_every,
+                    loss_callback=loss_callback,
+                    stop_flag=lambda: not self.training,
+                )
+                self._set_train_status("Training complete.")
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self._set_train_status(f"Training error: {e}", error=True)
+            finally:
+                self.training = False
+                dpg.configure_item("train_button", enabled=True, label="Start Training")
+                dpg.configure_item("stop_button", enabled=False)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def stop_training(self):
+        self.training = False
+        self.set_status("Stopping after current step...")
 
     # ------------------------------------------------------------------
     # Build UI
@@ -369,6 +481,9 @@ class GUI:
                             callback=self.on_mask_selected, width=700, height=450)
         dpg.add_file_extension("Images{.png,.jpg,.jpeg}", parent="dlg_mask")
 
+        dpg.add_file_dialog(tag="dlg_data_dir", show=False, directory_selector=True,
+                            callback=self.on_data_dir_selected, width=700, height=450)
+
         with dpg.handler_registry():
             dpg.add_mouse_down_handler(callback=self.on_mouse_down)
             dpg.add_mouse_click_handler(callback=self.on_mouse_click)
@@ -377,86 +492,144 @@ class GUI:
 
         with dpg.window(tag="main_window", label="SD Inpainting"):
 
-            with dpg.collapsing_header(label="Model", default_open=True):
-                dpg.add_button(tag="load_button", label="Load Model", callback=self.load_model)
+            with dpg.tab_bar():
 
-            dpg.add_separator()
+                # ══════════════════════════════════════════════════════
+                # TAB 1: Inference
+                # ══════════════════════════════════════════════════════
+                with dpg.tab(label="Inference"):
 
-            with dpg.collapsing_header(label="Inputs", default_open=True):
-                with dpg.group(horizontal=True):
-                    dpg.add_button(label="Select Image", callback=lambda: dpg.show_item("dlg_image"))
-                    dpg.add_text("", tag="image_path_text")
-                with dpg.group(horizontal=True):
-                    dpg.add_button(label="Load Mask from File", callback=lambda: dpg.show_item("dlg_mask"))
-                    dpg.add_text("", tag="mask_path_text")
+                    with dpg.collapsing_header(label="Model", default_open=True):
+                        dpg.add_button(tag="load_button", label="Load Model",
+                                       callback=self.load_model)
 
-            dpg.add_separator()
+                    dpg.add_separator()
 
-            with dpg.collapsing_header(label="Prompt", default_open=True):
-                dpg.add_input_text(tag="prompt_input", label="Prompt",
-                                   default_value="a red bow accessory on a cosplay costume",
-                                   width=600, height=60, multiline=True)
-                dpg.add_input_text(tag="neg_prompt_input", label="Negative prompt",
-                                   default_value="blurry, low quality, deformed", width=600)
+                    with dpg.collapsing_header(label="Inputs", default_open=True):
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="Select Image",
+                                           callback=lambda: dpg.show_item("dlg_image"))
+                            dpg.add_text("", tag="image_path_text")
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="Load Mask from File",
+                                           callback=lambda: dpg.show_item("dlg_mask"))
+                            dpg.add_text("", tag="mask_path_text")
 
-            dpg.add_separator()
+                    dpg.add_separator()
 
-            with dpg.collapsing_header(label="Parameters", default_open=True):
-                dpg.add_slider_int(tag="steps_slider", label="Steps",
-                                   default_value=30, min_value=10, max_value=100, width=300)
-                dpg.add_slider_float(tag="guidance_slider", label="Guidance scale",
-                                     default_value=7.5, min_value=1.0, max_value=20.0, width=300)
-                dpg.add_slider_float(tag="strength_slider", label="Strength",
-                                     default_value=0.99, min_value=0.1, max_value=1.0, width=300)
+                    with dpg.collapsing_header(label="Prompt", default_open=True):
+                        dpg.add_input_text(tag="prompt_input", label="Prompt",
+                                           default_value="a red bow accessory on a cosplay costume",
+                                           width=600, height=60, multiline=True)
+                        dpg.add_input_text(tag="neg_prompt_input", label="Negative prompt",
+                                           default_value="blurry, low quality, deformed", width=600)
 
-            dpg.add_separator()
+                    dpg.add_separator()
 
-            dpg.add_button(tag="run_button", label="Run Inpainting",
-                           callback=self.run_inference, enabled=False)
+                    with dpg.collapsing_header(label="Parameters", default_open=True):
+                        dpg.add_slider_int(tag="steps_slider", label="Steps",
+                                           default_value=30, min_value=10, max_value=100, width=300)
+                        dpg.add_slider_float(tag="guidance_slider", label="Guidance scale",
+                                             default_value=7.5, min_value=1.0, max_value=20.0, width=300)
+                        dpg.add_slider_float(tag="strength_slider", label="Strength",
+                                             default_value=0.99, min_value=0.1, max_value=1.0, width=300)
 
-            dpg.add_separator()
+                    dpg.add_separator()
 
-            with dpg.group(horizontal=True):
+                    dpg.add_button(tag="run_button", label="Run Inpainting",
+                                   callback=self.run_inference, enabled=False)
 
-                # LEFT: thumbnail + crop selector
-                with dpg.group():
-                    dpg.add_text("Crop Region  (drag yellow box)")
-                    with dpg.drawlist(width=THUMB_W, height=THUMB_H, tag="thumb_canvas"):
-                        dpg.draw_image("tex_thumb", pmin=(0, 0), pmax=(THUMB_W, THUMB_H))
-
-                dpg.add_spacer(width=16)
-
-                # MIDDLE: mask canvas
-                with dpg.group():
-                    dpg.add_text("Input Image  (paint mask here)")
-                    with dpg.drawlist(width=PREVIEW_W, height=PREVIEW_H, tag="mask_canvas_win"):
-                        dpg.draw_image("tex_image", pmin=(0, 0), pmax=(PREVIEW_W, PREVIEW_H), tag="canvas_img")
+                    dpg.add_separator()
 
                     with dpg.group(horizontal=True):
-                        dpg.add_radio_button(items=["brush", "rect"],
-                                             tag="draw_mode_radio", default_value="brush",
-                                             horizontal=True, callback=self.on_draw_mode_changed)
-                        dpg.add_spacer(width=12)
-                        dpg.add_slider_int(tag="brush_radius_slider", label="Brush size",
-                                           default_value=20, min_value=5, max_value=80, width=140,
-                                           callback=self.on_brush_radius_changed)
-                        dpg.add_spacer(width=12)
-                        dpg.add_checkbox(label="Erase", tag="erase_checkbox",
-                                         callback=self.on_erase_toggle)
-                        dpg.add_spacer(width=12)
-                        dpg.add_button(label="Clear", callback=self.clear_mask)
-                        dpg.add_button(label="Save Mask", callback=self.save_mask_to_disk)
 
-                dpg.add_spacer(width=16)
+                        with dpg.group():
+                            dpg.add_text("Crop Region  (drag yellow box)")
+                            with dpg.drawlist(width=THUMB_W, height=THUMB_H, tag="thumb_canvas"):
+                                dpg.draw_image("tex_thumb", pmin=(0, 0), pmax=(THUMB_W, THUMB_H))
 
-                # RIGHT: output
-                with dpg.group():
-                    dpg.add_text("Output")
-                    dpg.add_image("tex_output", tag="img_output",
-                                  width=PREVIEW_W, height=PREVIEW_H)
+                        dpg.add_spacer(width=16)
 
-            dpg.add_separator()
-            dpg.add_text("Ready.", tag="status_text", color=(180, 180, 180, 255))
+                        with dpg.group():
+                            dpg.add_text("Input Image  (paint mask here)")
+                            with dpg.drawlist(width=PREVIEW_W, height=PREVIEW_H, tag="mask_canvas_win"):
+                                dpg.draw_image("tex_image", pmin=(0, 0),
+                                               pmax=(PREVIEW_W, PREVIEW_H), tag="canvas_img")
+
+                            with dpg.group(horizontal=True):
+                                dpg.add_radio_button(items=["brush", "rect"],
+                                                     tag="draw_mode_radio", default_value="brush",
+                                                     horizontal=True, callback=self.on_draw_mode_changed)
+                                dpg.add_spacer(width=12)
+                                dpg.add_slider_int(tag="brush_radius_slider", label="Brush size",
+                                                   default_value=20, min_value=5, max_value=80, width=140,
+                                                   callback=self.on_brush_radius_changed)
+                                dpg.add_spacer(width=12)
+                                dpg.add_checkbox(label="Erase", tag="erase_checkbox",
+                                                 callback=self.on_erase_toggle)
+                                dpg.add_spacer(width=12)
+                                dpg.add_button(label="Clear", callback=self.clear_mask)
+                                dpg.add_button(label="Save Mask", callback=self.save_mask_to_disk)
+
+                        dpg.add_spacer(width=16)
+
+                        with dpg.group():
+                            dpg.add_text("Output")
+                            dpg.add_image("tex_output", tag="img_output",
+                                          width=PREVIEW_W, height=PREVIEW_H)
+
+                    dpg.add_separator()
+                    dpg.add_text("Ready.", tag="status_text", color=(180, 180, 180, 255))
+
+                # ══════════════════════════════════════════════════════
+                # TAB 2: Training
+                # ══════════════════════════════════════════════════════
+                with dpg.tab(label="Training"):
+
+                    with dpg.collapsing_header(label="Data", default_open=True):
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="Select Data Dir",
+                                           callback=lambda: dpg.show_item("dlg_data_dir"))
+                            dpg.add_input_text(tag="train_data_dir", label="",
+                                               default_value="./data", width=400)
+
+                    dpg.add_separator()
+
+                    with dpg.collapsing_header(label="Hyperparameters", default_open=True):
+                        dpg.add_slider_int(tag="train_epochs", label="Epochs",
+                                           default_value=10, min_value=1, max_value=100, width=300)
+                        dpg.add_slider_int(tag="train_batch_size", label="Batch size",
+                                           default_value=1, min_value=1, max_value=8, width=300)
+                        dpg.add_input_float(tag="train_lr", label="Learning rate",
+                                            default_value=2e-4, format="%.6f", width=200)
+                        dpg.add_slider_int(tag="train_rank", label="LoRA rank",
+                                           default_value=16, min_value=1, max_value=32, width=300)
+                        dpg.add_slider_int(tag="train_save_every", label="Save every N epochs",
+                                           default_value=1, min_value=1, max_value=10, width=300)
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="Select Output Dir",
+                                           callback=lambda: dpg.show_item("dlg_data_dir"))
+                            dpg.add_input_text(tag="train_out_dir", label="",
+                                               default_value="./lora_output", width=300)
+
+                    dpg.add_separator()
+
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(tag="train_button", label="Start Training",
+                                       callback=self.start_training)
+                        dpg.add_spacer(width=8)
+                        dpg.add_button(tag="stop_button", label="Stop",
+                                       callback=self.stop_training, enabled=False)
+
+                    dpg.add_separator()
+
+                    dpg.add_text("", tag="train_status_text", color=(180, 180, 180, 255))
+
+                    dpg.add_spacer(height=8)
+                    dpg.add_text("Loss")
+                    with dpg.drawlist(width=LOSS_W, height=LOSS_H, tag="loss_graph"):
+                        dpg.draw_rectangle(pmin=(0, 0), pmax=(LOSS_W, LOSS_H),
+                                           color=(50, 50, 50, 255), fill=(30, 30, 30, 255))
 
     # ------------------------------------------------------------------
     # Model
@@ -468,7 +641,7 @@ class GUI:
 
         def _worker():
             try:
-                model = SDInpaintingModel(device="cuda", dtype=torch.float16)
+                model = SDInpaintingModel(device="cuda", dtype=torch.float32)
                 model.eval_mode()
                 self.state["pipeline"] = model
                 self.set_status("Model loaded.")
@@ -507,7 +680,6 @@ class GUI:
 
         def _worker():
             try:
-                # Use the cropped region as input, not the full image
                 cropped = self._get_cropped_image()
                 image = cropped.resize((512, 512), Image.LANCZOS)
                 mask  = Image.fromarray((self.mask_np * 255).astype(np.uint8), mode="L").resize((512, 512))
@@ -552,5 +724,11 @@ class GUI:
         dpg.setup_dearpygui()
         dpg.show_viewport()
         dpg.set_primary_window("main_window", True)
-        dpg.start_dearpygui()
+
+        while dpg.is_dearpygui_running():
+            if self.loss_dirty:
+                self.loss_dirty = False
+                self._redraw_loss_graph()
+            dpg.render_dearpygui_frame()
+
         dpg.destroy_context()
