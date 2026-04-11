@@ -1,6 +1,4 @@
 outputs/*
 checkpoints/*
 data/*
-*.jpg
-*.jpeg
-*.png
+
