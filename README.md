@@ -1,4 +1,4 @@
-# (Local) GUI for SD 1.5 - Inpainting
+# (Local) Finetuning Pipeline + GUI for SD Inpainting
 Basic drawing functionality and +/- prompt inputs for mask-based inpainting.
 
 A GUI & pipeline for diffusion inference and finetuning (+ inference while finetuning).
