@@ -7,7 +7,7 @@ from diffusers import (
 )
 from transformers import CLIPTextModel, CLIPTokenizer
 from pathlib import Path
-
+import os
 
 class SDInpaintingModel:
     """
@@ -18,13 +18,15 @@ class SDInpaintingModel:
         checkpoints/vae/vae-ft-mse-840000-ema-pruned.safetensors
     """
 
-    CKPT_PATH = Path("checkpoints/inpainting/sd-v1-5-inpainting.ckpt")
-    VAE_PATH  = Path("checkpoints/vae/vae-ft-mse-840000-ema-pruned.safetensors")
+    CKPT_PATH = Path("checkpoints/inpainting")
+    VAE_PATH  = Path("checkpoints/vae")
 
-    def __init__(self, device: str = "cuda", dtype: torch.dtype = torch.float16):
+    def __init__(self, device: str = "cuda", dtype: torch.dtype = torch.float16, cfg=None):
         self.device = torch.device(device)
         self.dtype  = dtype
 
+        self.cfg = cfg
+                
         # Load everything via the pipeline converter, then unpack components
         pipeline = self._load_pipeline()
 
@@ -47,11 +49,14 @@ class SDInpaintingModel:
         from_single_file handles .ckpt → diffusers component conversion internally.
         We then swap in the finetuned VAE on top.
         """
+        ckpt = os.path.join(self.CKPT_PATH, self.cfg["main-name"], ".ckpt")
+        
         pipeline = StableDiffusionInpaintPipeline.from_single_file(
-            str(self.CKPT_PATH),
+            ckpt,
             torch_dtype=self.dtype,
             load_safety_checker=False,
         )
+        
         pipeline.vae = self._load_vae()
         pipeline = pipeline.to(self.device)
         return pipeline
@@ -61,11 +66,14 @@ class SDInpaintingModel:
         Load the finetuned MSE VAE from .safetensors.
         from_single_file works for both .ckpt and .safetensors here.
         """
+        ckpt = os.path.join(self.VAE_PATH, self.cfg["vae-name"], ".safetensors")
+        
         vae = AutoencoderKL.from_single_file(
-            str(self.VAE_PATH),
+            ckpt,
             torch_dtype=self.dtype,
         )
-        return vae  # .to(device) happens via pipeline.to() above
+        
+        return vae
 
     # ------------------------------------------------------------------
     # Training setup

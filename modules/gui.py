@@ -434,7 +434,6 @@ class GUI:
                     dpg.set_value("train_status_text",
                                 f"Epoch {epoch}  step {step}/{total_steps}  loss {loss:.4f}")
                     
-
                 self.trainer.train(
                     data_dir=data_dir,
                     epochs=epochs,
@@ -444,6 +443,7 @@ class GUI:
                     loss_callback=loss_callback,
                     stop_flag=lambda: not self.training,
                 )
+                
                 self._set_train_status("Training complete.")
             except Exception as e:
                 import traceback; traceback.print_exc()
@@ -585,32 +585,37 @@ class GUI:
                 # TAB 2: Training
                 # ══════════════════════════════════════════════════════
                 with dpg.tab(label="Training"):
-
+                    print(self.cfg)
                     with dpg.collapsing_header(label="Data", default_open=True):
                         with dpg.group(horizontal=True):
                             dpg.add_button(label="Select Data Dir",
                                            callback=lambda: dpg.show_item("dlg_data_dir"))
                             dpg.add_input_text(tag="train_data_dir", label="",
-                                               default_value="./data", width=400)
+                                               default_value=self.cfg["training"]["dataset"]["path"], width=400)
 
                     dpg.add_separator()
 
+                    epochs = self.cfg["training"]["settings"]["epochs"]
+                    bsize = self.cfg["training"]["settings"]["batch-size"]
+                    lr = self.cfg["training"]["settings"]["lr"]
+                    rank = self.cfg["training"]["settings"]["rank"]
+                    
                     with dpg.collapsing_header(label="Hyperparameters", default_open=True):
                         dpg.add_slider_int(tag="train_epochs", label="Epochs",
-                                           default_value=10, min_value=1, max_value=100, width=300)
+                                           default_value=epochs, min_value=1, max_value=100, width=300)
                         dpg.add_slider_int(tag="train_batch_size", label="Batch size",
-                                           default_value=1, min_value=1, max_value=8, width=300)
+                                           default_value=bsize, min_value=1, max_value=8, width=300)
                         dpg.add_input_float(tag="train_lr", label="Learning rate",
-                                            default_value=2e-4, format="%.6f", width=200)
+                                            default_value=lr, format="%.6f", width=200)
                         dpg.add_slider_int(tag="train_rank", label="LoRA rank",
-                                           default_value=16, min_value=1, max_value=32, width=300)
+                                           default_value=rank, min_value=1, max_value=32, width=300)
                         dpg.add_slider_int(tag="train_save_every", label="Save every N epochs",
-                                           default_value=1, min_value=1, max_value=10, width=300)
+                                           default_value=self.cfg["training"]["save_every"], min_value=1, max_value=10, width=300)
                         with dpg.group(horizontal=True):
                             dpg.add_button(label="Select Output Dir",
                                            callback=lambda: dpg.show_item("dlg_data_dir"))
                             dpg.add_input_text(tag="train_out_dir", label="",
-                                               default_value="./lora_output", width=300)
+                                               default_value=self.cfg["training"]["outputs"]["path"], width=300)
 
                     dpg.add_separator()
 
@@ -641,7 +646,7 @@ class GUI:
 
         def _worker():
             try:
-                model = SDInpaintingModel(device="cuda", dtype=torch.float32)
+                model = SDInpaintingModel(device="cuda", dtype=torch.float32, cfg=self.cfg["model"])
                 model.eval_mode()
                 self.state["pipeline"] = model
                 self.set_status("Model loaded.")

@@ -17,6 +17,12 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-path", type=str, default="")
+    
+    parser.add_argument("--outputs-path", type=str, default="")
+    parser.add_argument("--dataset-path", type=str, default="")
+    parser.add_argument("--model-name", type=str, default="")
+    parser.add_argument("--vae-name", type=str, default="")
+    
     args = parser.parse_args()
     
     # User config for GUI and training
@@ -25,7 +31,13 @@ if __name__ == "__main__":
         with open(args.config_path) as fp:
             user_config = json.load(fp)
         deep_update(config, user_config)
-        
+    
+    # Overide with use inputs
+    if args.outputs_path != "": cfg["training"]["outputs"]["path"]=args.outputs_path
+    if args.model_name != "": cfg["model"]["main-name"]=args.model_name
+    if args.vae_name != "": cfg["model"]["vae-name"]=args.vae_name
+    if args.dataset_path != "": cfg["training"]["dataset"]["path"]=args.dataset_path
+    
         
     gui = GUI(cfg)
     gui.run()

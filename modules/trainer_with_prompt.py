@@ -22,7 +22,8 @@ class InpaintingDataset(Dataset):
         self.data_dir = Path(data_dir)
         self.size = size
         
-        json_path = self.data_dir / "metadata.json"
+
+        json_path = self.data_dir / "data.json"
         with open(json_path) as f:
             self.samples = json.load(f)
 
@@ -54,7 +55,8 @@ class InpaintingDataset(Dataset):
         category  = self.cfg["category-info"]
         quality   = self.cfg["quality-info"]
         
-        prompt    = f"{trigger}, {category}, {quality}"
+        detail    = entry["text"].replace(" and ", ", ")
+        prompt    = f"{trigger}, {detail}, {category}, {quality}"
 
         image_t = torch.tensor(np.array(image), dtype=torch.float32).permute(2, 0, 1) / 127.5 - 1.0
         mask_t  = torch.tensor(np.array(mask),  dtype=torch.float32).unsqueeze(0) / 255.0
@@ -71,7 +73,7 @@ class InpaintingDataset(Dataset):
 
 class SDInpaintingTrainer:
 
-    def __init__(self, model, output_dir: str = "./outputs", rank: int = 4, cfg=None):
+    def __init__(self, model, output_dir: str = "./lora_output", rank: int = 4, cfg=None):
         self.cfg = cfg
 
         self.model = model
